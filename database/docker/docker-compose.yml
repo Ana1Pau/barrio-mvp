@@ -1,0 +1,67 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    container_name: barrio-mvp-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Define MSSQL_SA_PASSWORD en database/docker/.env}
+      MSSQL_PID: Developer
+    ports:
+      - "127.0.0.1:1434:1433"
+    volumes:
+      - barrio_mvp_sql_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/1433' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    restart: unless-stopped
+
+  deploy-schema:
+    image: mcr.microsoft.com/mssql-tools
+    container_name: barrio-mvp-deploy-schema
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Define MSSQL_SA_PASSWORD en database/docker/.env}
+      BARRIO_API_DB_PASSWORD: ${BARRIO_API_DB_PASSWORD:?Define BARRIO_API_DB_PASSWORD en database/docker/.env}
+    entrypoint: ["/bin/bash", "/scripts-entry/deploy.sh"]
+    volumes:
+      - ../sql:/scripts:ro
+      - ./deploy.sh:/scripts-entry/deploy.sh:ro
+      - ./create_api_user.sql:/scripts-entry/create_api_user.sql:ro
+
+  api:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    container_name: barrio-mvp-api
+    restart: unless-stopped
+    depends_on:
+      deploy-schema:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      BARRIO_WEB_ROOT: /app/public
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8081}
+      JWT_SECRET: ${JWT_SECRET:?Define JWT_SECRET en database/docker/.env}
+      BARRIO_DB_SERVER: sqlserver
+      BARRIO_DB_NAME: BarrioDB
+      BARRIO_DB_AUTH_MODE: sql-password
+      BARRIO_DB_TRUST_SERVER_CERTIFICATE: "true"
+      BARRIO_ALLOW_SQL_PASSWORD_AUTH: "true"
+      BARRIO_DB_USER: barrio_app_api
+      BARRIO_DB_PASSWORD: ${BARRIO_API_DB_PASSWORD:?Define BARRIO_API_DB_PASSWORD en database/docker/.env}
+      PAYMENTS_MODE: ${PAYMENTS_MODE:-simulated}
+      PEY_LIVE_CHARGES_ENABLED: ${PEY_LIVE_CHARGES_ENABLED:-false}
+      PEY_API_KEY: ${PEY_API_KEY:-}
+      PEY_WEBHOOK_SECRET: ${PEY_WEBHOOK_SECRET:-}
+      PEY_WEBHOOK_TOLERANCE_SECONDS: ${PEY_WEBHOOK_TOLERANCE_SECONDS:-300}
+    ports:
+      - "127.0.0.1:8081:8080"
+
+volumes:
+  barrio_mvp_sql_data:

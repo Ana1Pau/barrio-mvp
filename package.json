@@ -1,0 +1,7 @@
+{
+  "name": "barrio-mvp",
+  "private": true,
+  "type": "module",
+  "workspaces": ["apps/api"],
+  "engines": { "node": ">=20" }
+}
