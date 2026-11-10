@@ -11,7 +11,7 @@ MVP de BARRIO: una plataforma para descubrir comercios locales, administrar nego
 - `public/`: archivos servidos por Vercel, incluida la app en `/app` y el mapa en `/map`.
 - `supabase/migrations/`: migraciones de base de datos en orden cronológico.
 - `database/`: esquema SQL Server heredado, ejemplos de conexión y guías.
-- `docs/`: guía de activación de Pey y manual visual.
+- `docs/`: guía de activación de Pey, manual visual y documento de coordinación del MVP con auditoría UX.
 
 ## Desarrollo local
 
@@ -41,5 +41,5 @@ Configura `PEY_API_KEY`, `PEY_WEBHOOK_SECRET` y las variables de Supabase única
 
 ## Estado del MVP
 
-El producto está en desarrollo y la integración de Pey funciona contra su API de producción; Pey no ofrece un entorno dedicado de pruebas en su documentación actual. Las altas CoDi y los cobros dependen de los permisos, validaciones y estados que devuelve Pey y Banxico. Consulta el tablero o los documentos del proyecto para distinguir flujos listos, pendientes y demostrativos.
+El producto está en desarrollo y la integración de Pey funciona contra su API de producción; Pey no ofrece un entorno dedicado de pruebas en su documentación actual. Las altas CoDi y los cobros dependen de los permisos, validaciones y estados que devuelve Pey y Banxico. Consulta el tablero y el [documento de coordinación del MVP y auditoría UX](docs/BARRIO-KYRA_coordinacion-y-auditoria-UX.pdf) para distinguir flujos listos, pendientes y demostrativos, y alinear la revisión entre socios.
 
