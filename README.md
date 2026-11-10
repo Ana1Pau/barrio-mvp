@@ -31,7 +31,7 @@ Sirve `public/` con un servidor estático local para probar la interfaz. La app 
 
 ## Base de datos
 
-Aplica los archivos de `supabase/migrations/` en orden (`20261108000100` a `20261108000400`) desde Supabase SQL Editor. Revisa [`supabase/README.md`](supabase/README.md) y [`database/README.md`](database/README.md) antes de configurar otra instancia.
+Aplica los archivos de `supabase/migrations/` en orden (`20261108000100` a `20261108000500`) desde Supabase SQL Editor. Revisa [`supabase/README.md`](supabase/README.md) y [`database/README.md`](database/README.md) antes de configurar otra instancia.
 
 ## Pey y datos sensibles
 
@@ -41,5 +41,5 @@ Configura `PEY_API_KEY`, `PEY_WEBHOOK_SECRET` y las variables de Supabase única
 
 ## Estado del MVP
 
-El producto está en desarrollo y la integración de Pey funciona contra su API de producción; Pey no ofrece un entorno dedicado de pruebas en su documentación actual. Las altas CoDi y los cobros dependen de los permisos, validaciones y estados que devuelve Pey y Banxico. Consulta el tablero y el [documento de coordinación del MVP y auditoría UX](docs/BARRIO-KYRA_coordinacion-y-auditoria-UX.pdf) para distinguir flujos listos, pendientes y demostrativos, y alinear la revisión entre socios.
+El producto está en desarrollo. El registro admite hasta 120 solicitudes de alta por IP cada 15 minutos, para permitir un piloto de alrededor de 100 cuentas nuevas incluso cuando varias personas comparten red. Es un límite de solicitudes por ventana, no un máximo total de cuentas ni una garantía de 100 usuarios simultáneos. La integración de Pey funciona contra su API de producción; Pey no ofrece un entorno dedicado de pruebas en su documentación actual. Las altas CoDi y los cobros dependen de los permisos, validaciones y estados que devuelve Pey y Banxico. Consulta el tablero y el [documento de coordinación del MVP y auditoría UX](docs/BARRIO-KYRA_coordinacion-y-auditoria-UX.pdf) para distinguir flujos listos, pendientes y demostrativos, y alinear la revisión entre socios.
 

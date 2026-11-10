@@ -29,12 +29,15 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Headers', 'authorization,content-type,idempotency-key');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,OPTIONS');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
 
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false });
+// A pilot group can share one public IP (school, office, community Wi-Fi).
+// Keep registration separate from login and allow at least 100 accounts/IP/window.
+const registrationLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: 'draft-8', legacyHeaders: false });
 const jsonParser = express.json({ limit: '64kb', type: 'application/json' });
 app.get('/healthz', async (_req, res) => {
   try {
@@ -70,7 +73,7 @@ function requireRole(role) {
 }
 const id = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value || '');
 
-app.post('/api/v1/auth/register', authLimiter, jsonParser, async (req, res, next) => {
+app.post('/api/v1/auth/register', registrationLimiter, jsonParser, async (req, res, next) => {
   try {
     const { email, phone, password, displayName, biography = null, neighborhood = null, accountType = 'buyer' } = req.body || {};
     if (typeof email !== 'string' || !/^\S+@\S+\.\S+$/.test(email) || email.length > 256) return res.status(422).json({ error: 'valid_email_required' });
@@ -139,7 +142,55 @@ app.get('/api/v1/auth/me', bearer, (req, res) => res.json({ userId: req.user.sub
 
 app.get('/api/v1/merchants', async (_req, res, next) => {
   try {
-    if (supabase) return res.json({ items: [] });
+    // Public directory data should always reflect the latest merchant record.
+    res.setHeader('Cache-Control', 'no-store');
+    if (supabase) {
+      const merchants = await supabase.select('barrio_merchants', {
+        select: 'id,name,description,neighborhood_id,show_in_directory',
+        active: 'eq.true', show_in_directory: 'eq.true', order: 'name.asc', limit: '200',
+      });
+      if (!merchants.length) return res.json({ items: [] });
+      const ids = merchants.map((merchant) => merchant.id);
+      const inFilter = `in.(${ids.join(',')})`;
+      const [zones, assignments, categories, enabledMethods, methodCatalog] = await Promise.all([
+        supabase.select('barrio_neighborhoods', { select: 'id,name' }),
+        supabase.select('barrio_merchant_categories', { select: 'merchant_id,category_id', merchant_id: inFilter }),
+        supabase.select('barrio_categories', { select: 'id,name', active: 'eq.true' }),
+        supabase.select('barrio_merchant_payment_methods', { select: 'merchant_id,method_code', merchant_id: inFilter, selected: 'eq.true', enabled: 'eq.true' }),
+        supabase.select('barrio_payment_methods', { select: 'code,name' }),
+      ]);
+      const zoneById = new Map(zones.map((zone) => [String(zone.id), zone.name]));
+      const categoryById = new Map(categories.map((category) => [String(category.id), category.name]));
+      const categoryByMerchant = new Map(assignments.map((row) => [row.merchant_id, categoryById.get(String(row.category_id)) || 'Otros']));
+      const methodNameByCode = new Map(methodCatalog.map((method) => [method.code, method.name]));
+      const methodsByMerchant = new Map();
+      for (const row of enabledMethods) {
+        const list = methodsByMerchant.get(row.merchant_id) || [];
+        list.push({ code: row.method_code, name: methodNameByCode.get(row.method_code) || row.method_code });
+        methodsByMerchant.set(row.merchant_id, list);
+      }
+      const categoryPresentation = {
+        Cafeterias: { kind: 'Cafés', type: 'Cafetería', emoji: '☕', art: 'cafe' },
+        Alimentos: { kind: 'Todos', type: 'Alimentos', emoji: '🥖', art: 'cafe' },
+        Tiendas: { kind: 'Tiendas', type: 'Tienda', emoji: '🏪', art: 'flowers' },
+        Servicios: { kind: 'Servicios', type: 'Servicios', emoji: '🔧', art: 'tools' },
+        Flores: { kind: 'Tiendas', type: 'Flores y plantas', emoji: '🌷', art: 'flowers' },
+        Belleza: { kind: 'Servicios', type: 'Belleza', emoji: '✂️', art: 'tools' },
+        Hogar: { kind: 'Tiendas', type: 'Hogar', emoji: '🏠', art: 'flowers' },
+        Otros: { kind: 'Todos', type: 'Comercio local', emoji: '🏬', art: 'cafe' },
+      };
+      return res.json({ items: merchants.map((merchant) => {
+        const category = categoryByMerchant.get(merchant.id) || 'Otros';
+        return {
+          id: merchant.id, merchantId: merchant.id, name: merchant.name,
+          description: merchant.description || '', about: merchant.description || 'Comercio local de tu barrio.',
+          zone: zoneById.get(String(merchant.neighborhood_id)) || '',
+          category, showInDirectory: merchant.show_in_directory,
+          ...categoryPresentation[category], followers: '—', posts: '—',
+          paymentMethods: methodsByMerchant.get(merchant.id) || [],
+        };
+      }) });
+    }
     const result = await query(config.db, 'SELECT TOP (200) ComercioId AS id, NombreNegocio AS name, Descripcion AS description, Colonia, Latitud AS latitude, Longitud AS longitude FROM app.PerfilPublicoComercio ORDER BY NombreNegocio');
     res.json({ items: result.recordset });
   } catch (err) { next(err); }
@@ -165,7 +216,16 @@ app.get('/api/v1/merchant/profiles', bearer, requireRole('Comercio'), async (req
 app.get('/api/v1/merchants/:merchantId/products', async (req, res, next) => {
   try {
     if (!id(req.params.merchantId)) return res.status(400).json({ error: 'invalid_merchant_id' });
-    if (supabase) return res.json({ items: [] });
+    if (supabase) {
+      res.setHeader('Cache-Control', 'no-store');
+      const merchant = await supabase.select('barrio_merchants', { select: 'id', id: `eq.${req.params.merchantId}`, active: 'eq.true', show_in_directory: 'eq.true', limit: '1' });
+      if (!merchant[0]) return res.json({ items: [] });
+      const products = await supabase.select('barrio_products', {
+        select: 'id,merchant_id,name,description,category,price_mxn,stock',
+        merchant_id: `eq.${req.params.merchantId}`, active: 'eq.true', stock: 'gt.0', order: 'name.asc', limit: '200',
+      });
+      return res.json({ items: products.map((product) => ({ ...product, merchantId: product.merchant_id, priceMXN: Number(product.price_mxn), emoji: '🛍️' })) });
+    }
     const result = await query(config.db, `SELECT ProductoId AS id, ComercioId AS merchantId, Nombre AS name, DescripcionCorta AS description, Precio AS priceMXN, Existencias AS stock FROM app.ProductosPublicos WHERE ComercioId=@merchantId AND Existencias>0 ORDER BY Nombre`, (r, t) => r.input('merchantId', t.UniqueIdentifier, req.params.merchantId));
     res.json({ items: result.recordset });
   } catch (err) { next(err); }
@@ -237,7 +297,24 @@ app.put('/api/v1/merchant/payment-methods', bearer, requireRole('Comercio'), jso
     if (supabase) {
       const merchantId = req.body?.merchantId;
       if (!id(merchantId || '')) return res.status(422).json({ error: 'merchant_id_required' });
-      return res.json({ items: await supabase.rpc('barrio_save_payment_methods_for_merchant', { p_user_id: req.user.sub, p_merchant_id: merchantId, p_methods: methods }) });
+      const saved = await supabase.rpc('barrio_save_payment_methods_for_merchant', { p_user_id: req.user.sub, p_merchant_id: merchantId, p_methods: methods });
+      // Saving preferences must not reset a previously verified Pey account
+      // to REQUIERE_PEY. The SQL preference function predates account-status
+      // synchronization, so re-apply the authoritative status returned by Pey.
+      const account = await supabase.select('barrio_pey_bank_accounts', {
+        select: 'codi_status', merchant_id: `eq.${merchantId}`, limit: '1',
+      });
+      if (account[0]) {
+        const selected = methods.find((method) => method.code === 'PEY_CODI')?.selected === true;
+        const status = String(account[0].codi_status || '').toUpperCase();
+        await supabase.upsert('barrio_merchant_payment_methods', {
+          merchant_id: merchantId, method_code: 'PEY_CODI', selected,
+          enabled: selected && status === 'ACTIVE',
+          configuration_status: !selected ? 'PENDIENTE' : status === 'ACTIVE' ? 'DISPONIBLE' : status === 'ERROR' ? 'REQUIERE_PEY' : 'PENDIENTE',
+          updated_at: new Date().toISOString(),
+        }, 'merchant_id,method_code');
+      }
+      return res.json({ items: saved });
     }
     const result=await execute(config.db,'app.sp_GuardarMetodosPagoPropios',(r,t)=>r.input('UsuarioId',t.UniqueIdentifier,req.user.sub).input('MetodosJson',t.NVarChar(sql.MAX),JSON.stringify(methods)));
     res.json({items:result.recordset||[]});
@@ -268,10 +345,17 @@ app.get('/api/v1/merchant/profile', bearer, requireRole('Comercio'), async (req,
 
 app.post('/api/v1/merchant/products', bearer, requireRole('Comercio'), jsonParser, async (req, res, next) => {
   try {
-    if (supabase) return res.status(501).json({ error: 'merchant_products_not_connected_in_supabase_mvp' });
-    const { name, description = null, priceMXN, stock } = req.body || {};
+    const { merchantId: requestedMerchantId, name, description = null, category = 'Otros', priceMXN, stock } = req.body || {};
     if (typeof name !== 'string' || !name.trim() || name.length > 150 || !Number.isFinite(priceMXN) || priceMXN <= 0 || !Number.isInteger(stock) || stock < 0) return res.status(422).json({ error: 'invalid_product' });
     if (description !== null && (typeof description !== 'string' || description.length > 160)) return res.status(422).json({ error: 'invalid_description' });
+    if (typeof category !== 'string' || !category.trim() || category.length > 60) return res.status(422).json({ error: 'invalid_category' });
+    if (supabase) {
+      if (!id(requestedMerchantId || '')) return res.status(422).json({ error: 'merchant_id_required' });
+      const merchants = await supabase.select('barrio_merchants', { select: 'id', id: `eq.${requestedMerchantId}`, owner_user_id: `eq.${req.user.sub}`, active: 'eq.true', limit: '1' });
+      if (!merchants[0]) return res.status(404).json({ error: 'merchant_profile_required' });
+      const created = await supabase.insert('barrio_products', { merchant_id: requestedMerchantId, name: name.trim(), description: description?.trim() || null, category: category.trim(), price_mxn: priceMXN, stock, active: true });
+      return res.status(201).json({ productId: created[0].id, merchantId: requestedMerchantId });
+    }
     const merchant = await execute(config.db, 'app.sp_ObtenerComercioPropio', (r, t) => r.input('UsuarioId', t.UniqueIdentifier, req.user.sub));
     const merchantId = merchant.recordset?.[0]?.ComercioId;
     if (!merchantId) return res.status(409).json({ error: 'merchant_profile_required' });
@@ -284,6 +368,33 @@ app.post('/api/v1/merchant/products', bearer, requireRole('Comercio'), jsonParse
       .input('Existencias', t.Int, stock)
       .output('ProductoId', t.UniqueIdentifier));
     res.status(201).json({ productId: created.output.ProductoId, merchantId });
+  } catch (err) { next(err); }
+});
+
+app.get('/api/v1/merchant/products', bearer, requireRole('Comercio'), async (req, res, next) => {
+  try {
+    if (!supabase) return res.status(501).json({ error: 'merchant_products_require_supabase_mvp' });
+    const merchantId = req.query.merchantId;
+    if (!id(merchantId || '')) return res.status(422).json({ error: 'merchant_id_required' });
+    const merchants = await supabase.select('barrio_merchants', { select: 'id', id: `eq.${merchantId}`, owner_user_id: `eq.${req.user.sub}`, active: 'eq.true', limit: '1' });
+    if (!merchants[0]) return res.status(404).json({ error: 'merchant_profile_required' });
+    const products = await supabase.select('barrio_products', { select: 'id,merchant_id,name,description,category,price_mxn,stock,active', merchant_id: `eq.${merchantId}`, order: 'created_at.desc', limit: '200' });
+    return res.json({ items: products.map((product) => ({ id: product.id, merchantId: product.merchant_id, name: product.name, description: product.description || '', category: product.category, price: Number(product.price_mxn), stock: product.stock, active: product.active, status: product.stock > 0 ? 'En existencia' : 'Agotado', emoji: '🛍️' })) });
+  } catch (err) { next(err); }
+});
+
+app.put('/api/v1/merchant/products/:productId', bearer, requireRole('Comercio'), jsonParser, async (req, res, next) => {
+  try {
+    if (!supabase) return res.status(501).json({ error: 'merchant_products_require_supabase_mvp' });
+    if (!id(req.params.productId)) return res.status(400).json({ error: 'invalid_product_id' });
+    const { merchantId, name, description = null, category = 'Otros', priceMXN, stock, active = true } = req.body || {};
+    if (!id(merchantId || '') || typeof name !== 'string' || !name.trim() || name.length > 150 || !Number.isFinite(priceMXN) || priceMXN <= 0 || !Number.isInteger(stock) || stock < 0 || typeof active !== 'boolean') return res.status(422).json({ error: 'invalid_product' });
+    if (description !== null && (typeof description !== 'string' || description.length > 160)) return res.status(422).json({ error: 'invalid_description' });
+    const merchants = await supabase.select('barrio_merchants', { select: 'id', id: `eq.${merchantId}`, owner_user_id: `eq.${req.user.sub}`, active: 'eq.true', limit: '1' });
+    if (!merchants[0]) return res.status(404).json({ error: 'merchant_profile_required' });
+    const updated = await supabase.update('barrio_products', { id: `eq.${req.params.productId}`, merchant_id: `eq.${merchantId}` }, { name: name.trim(), description: description?.trim() || null, category: String(category).slice(0,60), price_mxn: priceMXN, stock, active, updated_at: new Date().toISOString() });
+    if (!updated?.length) return res.status(404).json({ error: 'product_not_found' });
+    return res.json({ productId: req.params.productId, merchantId });
   } catch (err) { next(err); }
 });
 
@@ -441,9 +552,38 @@ app.get('/api/v1/merchant/codi/qr/latest', bearer, requireRole('Comercio'), asyn
   } catch (err) { next(err); }
 });
 
-app.post('/api/v1/orders/checkout', bearer, requireRole('Comprador'), jsonParser, async (req, res, next) => {
+app.post('/api/v1/orders/checkout', bearer, requireRole('Comprador'), authLimiter, jsonParser, async (req, res, next) => {
   try {
-    if (supabase) return res.status(501).json({ error: 'orders_not_connected_in_supabase_mvp' });
+    if (supabase) {
+      if (config.paymentMode !== 'pey') return res.status(503).json({ error: 'pey_live_payments_not_enabled' });
+      const { merchantId, items, deliveryMethod = 'RECOGER', deliveryAddress = null } = req.body || {};
+      const key = req.get('Idempotency-Key');
+      if (!id(merchantId || '') || !Array.isArray(items) || items.length < 1 || items.length > 50 || items.some((item) => !id(item?.productId || '') || !Number.isInteger(item?.quantity) || item.quantity < 1 || item.quantity > 100)) return res.status(422).json({ error: 'invalid_checkout' });
+      if (!key || key.length < 16 || key.length > 100) return res.status(422).json({ error: 'idempotency_key_required' });
+      if (!['RECOGER','ENTREGA_LOCAL'].includes(deliveryMethod) || (deliveryMethod === 'ENTREGA_LOCAL' && (typeof deliveryAddress !== 'string' || !deliveryAddress.trim() || deliveryAddress.length > 300))) return res.status(422).json({ error: 'invalid_delivery_method' });
+      const created = await supabase.rpc('barrio_create_checkout_order', {
+        p_user_id: req.user.sub, p_merchant_id: merchantId, p_key: key, p_items: items,
+        p_delivery_method: deliveryMethod, p_delivery_address: deliveryAddress,
+      });
+      const numRef = String(randomInt(0, 10000000)).padStart(7, '0');
+      const qrKey = `checkout-${created.order_id}`;
+      const started = await supabase.rpc('barrio_begin_checkout_qr', { p_user_id: req.user.sub, p_order_id: created.order_id, p_key: qrKey, p_num_ref: numRef });
+      if (!started.should_create) {
+        if (started.status === 'PAID') return res.status(200).json({ orderId: created.order_id, merchantId, amountMXN: Number(started.amount_mxn), paymentStatus: 'PAGADO', expiresAt: started.expires_at });
+        if (started.status === 'PENDING' && started.qr_string) return res.status(200).json({ orderId: created.order_id, merchantId, amountMXN: Number(started.amount_mxn), qrImageDataUrl: await QRCode.toDataURL(started.qr_string), paymentStatus: 'PENDIENTE', expiresAt: started.expires_at });
+        return res.status(409).json({ error: 'checkout_requires_reconciliation', orderId: created.order_id, paymentStatus: started.status });
+      }
+      try {
+        const qr = await createQr({ amount: Number(created.total_mxn), concept: `BARRIO ${String(created.order_id).slice(0,8)}`, expiration: 600, numRef: started.num_ref, bankAccountId: started.bank_account_id, metadata: { barrioQrRequestId: started.request_id, barrioOrderId: created.order_id } }, config.peyApiKey, { allowProduction: true });
+        if (!qr?.id || !qr?.qrString) throw new Error('Pey response did not include QR data');
+        const expiresAt = new Date(Date.now() + 600000).toISOString();
+        const saved = await supabase.rpc('barrio_finish_checkout_qr', { p_user_id: req.user.sub, p_request_id: started.request_id, p_pey_qr_id: qr.id, p_qr_string: qr.qrString, p_expires_at: expiresAt });
+        return res.status(201).json({ orderId: created.order_id, merchantId, amountMXN: Number(saved.amount_mxn), qrImageDataUrl: await QRCode.toDataURL(saved.qr_string), paymentStatus: 'PENDIENTE', expiresAt: saved.expires_at });
+      } catch (providerError) {
+        await supabase.rpc('barrio_mark_checkout_qr_uncertain', { p_user_id: req.user.sub, p_request_id: started.request_id });
+        throw providerError;
+      }
+    }
     const { merchantId, items, deliveryMethod = 'RECOGER', deliveryAddress = null } = req.body || {};
     const key = req.get('Idempotency-Key');
     if (!id(merchantId) || !Array.isArray(items) || items.length < 1 || items.length > 50 || items.some((x) => !id(x.productId) || !Number.isInteger(x.quantity) || x.quantity < 1 || x.quantity > 100)) return res.status(422).json({ error: 'invalid_checkout' });
@@ -487,7 +627,26 @@ app.post('/api/v1/orders/checkout', bearer, requireRole('Comprador'), jsonParser
 
 app.get('/api/v1/orders/:orderId', bearer, async (req, res, next) => {
   try {
-    if (supabase) return res.status(501).json({ error: 'orders_not_connected_in_supabase_mvp' });
+    if (supabase) {
+      if (!id(req.params.orderId)) return res.status(400).json({ error: 'invalid_order_id' });
+      const ownedMerchants = req.user.roles.includes('Comercio') ? await supabase.select('barrio_merchants', { select: 'id', owner_user_id: `eq.${req.user.sub}`, active: 'eq.true' }) : [];
+      const accessFilter = ownedMerchants.length ? `or=(buyer_user_id.eq.${req.user.sub},merchant_id.in.(${ownedMerchants.map((merchant) => merchant.id).join(',')}))` : `buyer_user_id=eq.${req.user.sub}`;
+      const orders = await supabase.select('barrio_orders', { select: 'id,buyer_user_id,merchant_id,total_mxn,delivery_method,delivery_address,status,pey_qr_request_id,created_at,paid_at', id: `eq.${req.params.orderId}`, [accessFilter.split('=')[0]]: accessFilter.slice(accessFilter.indexOf('=')+1), limit: '1' });
+      const order = orders[0];
+      if (!order) return res.status(404).json({ error: 'not_found' });
+      const [items, merchant, qr] = await Promise.all([
+        supabase.select('barrio_order_items', { select: 'product_name,unit_price_mxn,quantity,line_total_mxn', order_id: `eq.${order.id}` }),
+        supabase.select('barrio_merchants', { select: 'name,neighborhood_id', id: `eq.${order.merchant_id}`, limit: '1' }),
+        order.pey_qr_request_id ? supabase.select('barrio_pey_qr_requests', { select: 'status,expires_at,paid_at', id: `eq.${order.pey_qr_request_id}`, limit: '1' }) : Promise.resolve([]),
+      ]);
+      if (qr[0]?.status === 'PENDING' && qr[0].expires_at && new Date(qr[0].expires_at).getTime() <= Date.now()) {
+        await supabase.update('barrio_pey_qr_requests', { id: `eq.${order.pey_qr_request_id}`, status: 'eq.PENDING' }, { status: 'EXPIRED' });
+        await supabase.rpc('barrio_expire_checkout_order', { p_order_id: order.id });
+        qr[0].status = 'EXPIRED';
+        order.status = 'EXPIRED';
+      }
+      return res.json({ order: { id: order.id, merchantId: order.merchant_id, merchantName: merchant[0]?.name || '', amountMXN: Number(order.total_mxn), status: order.status, paymentStatus: qr[0]?.status || order.status, deliveryMethod: order.delivery_method, deliveryAddress: order.delivery_address, items: items.map((item) => ({ name: item.product_name, price: Number(item.unit_price_mxn), quantity: item.quantity, total: Number(item.line_total_mxn) })), createdAt: order.created_at, paidAt: order.paid_at, expiresAt: qr[0]?.expires_at || null } });
+    }
     if (!id(req.params.orderId)) return res.status(400).json({ error: 'invalid_order_id' });
     const result = await execute(config.db, 'app.sp_ObtenerPedidoPropio', (r, t) => r.input('UsuarioId', t.UniqueIdentifier, req.user.sub).input('PedidoId', t.UniqueIdentifier, req.params.orderId));
     const order = result.recordset?.[0];
@@ -498,9 +657,70 @@ app.get('/api/v1/orders/:orderId', bearer, async (req, res, next) => {
 
 app.get('/api/v1/orders', bearer, async (req, res, next) => {
   try {
-    if (supabase) return res.status(501).json({ error: 'orders_not_connected_in_supabase_mvp' });
+    if (supabase) {
+      if (!req.user.roles.includes('Comprador')) return res.status(403).json({ error: 'forbidden' });
+      const orders = await supabase.select('barrio_orders', { select: 'id,buyer_user_id,merchant_id,total_mxn,delivery_method,delivery_address,status,created_at,paid_at', buyer_user_id: `eq.${req.user.sub}`, order: 'created_at.desc', limit: '100' });
+      const orderIds = orders.map((order) => order.id);
+      const merchantIds = [...new Set(orders.map((order) => order.merchant_id))];
+      const [merchants, items] = await Promise.all([
+        merchantIds.length ? supabase.select('barrio_merchants', { select: 'id,name,neighborhood_id', id: `in.(${merchantIds.join(',')})` }) : [],
+        orderIds.length ? supabase.select('barrio_order_items', { select: 'order_id,product_name,unit_price_mxn,quantity,line_total_mxn', order_id: `in.(${orderIds.join(',')})` }) : [],
+      ]);
+      const merchantById = new Map(merchants.map((merchant) => [merchant.id, merchant]));
+      const itemsByOrder = new Map();
+      for (const item of items) itemsByOrder.set(item.order_id, [...(itemsByOrder.get(item.order_id) || []), item]);
+      const neighborhoods = [...new Set(merchants.map((merchant) => merchant.neighborhood_id).filter(Boolean))];
+      const zones = neighborhoods.length ? await supabase.select('barrio_neighborhoods', { select: 'id,name,city', id: `in.(${neighborhoods.join(',')})` }) : [];
+      const zoneById = new Map(zones.map((zone) => [zone.id, zone]));
+      const statusLabels = { PENDING_PAYMENT: 'Pago pendiente', PAID: 'Nuevo', PREPARING: 'Preparando', READY: 'Listo', COMPLETED: 'Completado', CANCELLED: 'Cancelado', EXPIRED: 'Expirado' };
+      return res.json({ items: orders.map((order) => {
+        const merchant = merchantById.get(order.merchant_id);
+        const zone = zoneById.get(merchant?.neighborhood_id);
+        return { id: order.id, merchantId: order.merchant_id, merchantName: merchant?.name || 'Comercio', merchantZone: zone ? `${zone.name}, ${zone.city}` : '', amount: Number(order.total_mxn), status: statusLabels[order.status] || order.status, dbStatus: order.status, paymentStatus: order.status === 'PAID' || ['PREPARING','READY','COMPLETED'].includes(order.status) ? 'PAGADO' : order.status, deliveryMethod: order.delivery_method, createdAt: order.created_at, paidAt: order.paid_at, items: (itemsByOrder.get(order.id) || []).map((item) => ({ name: item.product_name, price: Number(item.unit_price_mxn), quantity: item.quantity, total: Number(item.line_total_mxn) })) };
+      }) });
+    }
     const result = await execute(config.db, 'app.sp_ListarPedidosPropios', (r, t) => r.input('UsuarioId', t.UniqueIdentifier, req.user.sub));
     res.json({ items: result.recordset || [] });
+  } catch (err) { next(err); }
+});
+
+app.get('/api/v1/merchant/orders', bearer, requireRole('Comercio'), async (req, res, next) => {
+  try {
+    if (!supabase) return res.status(501).json({ error: 'merchant_orders_require_supabase_mvp' });
+    const merchantId = req.query.merchantId;
+    if (!id(merchantId || '')) return res.status(422).json({ error: 'merchant_id_required' });
+    const owned = await supabase.select('barrio_merchants', { select: 'id', owner_user_id: `eq.${req.user.sub}`, active: 'eq.true', id: `eq.${merchantId}`, limit: '1' });
+    if (!owned[0]) return res.status(404).json({ error: 'merchant_profile_required' });
+    const orders = await supabase.select('barrio_orders', { select: 'id,buyer_user_id,merchant_id,total_mxn,delivery_method,delivery_address,status,created_at,paid_at', merchant_id: `eq.${merchantId}`, order: 'created_at.desc', limit: '100' });
+    const orderIds = orders.map((order) => order.id);
+    const buyerIds = [...new Set(orders.map((order) => order.buyer_user_id))];
+    const [profiles, items] = await Promise.all([
+      buyerIds.length ? supabase.select('barrio_profiles', { select: 'user_id,display_name', user_id: `in.(${buyerIds.join(',')})` }) : [],
+      orderIds.length ? supabase.select('barrio_order_items', { select: 'order_id,product_name,unit_price_mxn,quantity,line_total_mxn', order_id: `in.(${orderIds.join(',')})` }) : [],
+    ]);
+    const profileById = new Map(profiles.map((profile) => [profile.user_id, profile]));
+    const itemsByOrder = new Map();
+    for (const item of items) itemsByOrder.set(item.order_id, [...(itemsByOrder.get(item.order_id) || []), item]);
+    const statusLabels = { PENDING_PAYMENT: 'Pago pendiente', PAID: 'Nuevo', PREPARING: 'Preparando', READY: 'Listo', COMPLETED: 'Completado', CANCELLED: 'Cancelado', EXPIRED: 'Expirado' };
+    return res.json({ items: orders.map((order) => ({ id: order.id, merchantId: order.merchant_id, customer: profileById.get(order.buyer_user_id)?.display_name || 'Cliente', amount: Number(order.total_mxn), items: (itemsByOrder.get(order.id) || []).map((item) => ({ name: item.product_name, price: Number(item.unit_price_mxn), quantity: item.quantity, total: Number(item.line_total_mxn) })), status: statusLabels[order.status] || order.status, dbStatus: order.status, paymentStatus: order.status === 'PAID' || ['PREPARING','READY','COMPLETED'].includes(order.status) ? 'PAGADO' : order.status, deliveryMethod: order.delivery_method, deliveryAddress: order.delivery_address, createdAt: order.created_at, paidAt: order.paid_at })) });
+  } catch (err) { next(err); }
+});
+
+app.patch('/api/v1/merchant/orders/:orderId/status', bearer, requireRole('Comercio'), jsonParser, async (req, res, next) => {
+  try {
+    if (!supabase) return res.status(501).json({ error: 'merchant_orders_require_supabase_mvp' });
+    const { status } = req.body || {};
+    const nextByStatus = { PAID: 'PREPARING', PREPARING: 'READY', READY: 'COMPLETED' };
+    if (!id(req.params.orderId) || !['PREPARING','READY','COMPLETED'].includes(status)) return res.status(422).json({ error: 'invalid_order_status' });
+    const orders = await supabase.select('barrio_orders', { select: 'id,merchant_id,status', id: `eq.${req.params.orderId}`, limit: '1' });
+    const order = orders[0];
+    if (!order) return res.status(404).json({ error: 'order_not_found' });
+    const owned = await supabase.select('barrio_merchants', { select: 'id', id: `eq.${order.merchant_id}`, owner_user_id: `eq.${req.user.sub}`, active: 'eq.true', limit: '1' });
+    if (!owned[0]) return res.status(404).json({ error: 'order_not_found' });
+    if (nextByStatus[order.status] !== status) return res.status(409).json({ error: 'order_status_transition_not_allowed', currentStatus: order.status });
+    const updated = await supabase.update('barrio_orders', { id: `eq.${order.id}`, merchant_id: `eq.${order.merchant_id}`, status: `eq.${order.status}` }, { status });
+    if (!updated?.length) return res.status(409).json({ error: 'order_status_changed' });
+    return res.json({ orderId: order.id, status });
   } catch (err) { next(err); }
 });
 
@@ -527,12 +747,17 @@ app.post('/api/v1/webhooks/pey', express.raw({ type: 'application/json', limit: 
         console.error(JSON.stringify({ event: 'pey_webhook_payment_mismatch', webhookId: headers.webhookId }));
         return res.status(422).json({ error: 'payment_details_mismatch' });
       }
-      if (qrRequest.status === 'PAID' && qrRequest.transaction_id === event.transactionId) return res.status(202).json({ received: true, duplicate: true });
+      if (qrRequest.status === 'PAID' && qrRequest.transaction_id === event.transactionId) {
+        // Reconcile an order if an earlier webhook updated the QR but failed before updating the order.
+        await supabase.update('barrio_orders', { pey_qr_request_id: `eq.${qrRequest.id}`, status: 'in.(PENDING_PAYMENT,EXPIRED)' }, { status: 'PAID', paid_at: new Date(Number(event.datePaid) * 1000).toISOString() });
+        return res.status(202).json({ received: true, duplicate: true });
+      }
       const updated = await supabase.update('barrio_pey_qr_requests', { id: `eq.${qrRequest.id}`, status: 'in.(PENDING,EXPIRED)' }, {
         status: 'PAID', transaction_id: event.transactionId,
         paid_at: new Date(Number(event.datePaid) * 1000).toISOString(),
       });
       if (!updated?.length) return res.status(409).json({ error: 'payment_state_conflict' });
+      await supabase.update('barrio_orders', { pey_qr_request_id: `eq.${qrRequest.id}`, status: 'in.(PENDING_PAYMENT,EXPIRED)' }, { status: 'PAID', paid_at: new Date(Number(event.datePaid) * 1000).toISOString() });
       return res.status(202).json({ received: true });
     }
     await execute(config.db, 'app.sp_ProcesarWebhookPey', (r, t) => r
@@ -552,7 +777,7 @@ app.use((err, req, res, _next) => {
   const duplicateAccount = req.path === '/api/v1/auth/register' && duplicate;
   const limitReached = String(err.message || '').includes('merchant_limit_reached');
   const status = duplicateAccount || limitReached ? 409 : (err.status || (err instanceof TypeError ? 422 : ([2601, 2627, 50102, 50104, 50108, 50109, 50111].includes(err.number) ? 409 : ([50101, 50103, 50105].includes(err.number) ? 403 : ([50112, 50114, 50119, 50122].includes(err.number) ? 409 : 500)))));
-  const publicCodes = ['bank_account_not_registered','bank_account_registration_requires_reconciliation','merchant_bank_account_not_active','merchant_profile_required','merchant_limit_reached','idempotency_key_conflict','active_qr_exists','qr_request_requires_reconciliation'];
+  const publicCodes = ['bank_account_not_registered','bank_account_registration_requires_reconciliation','merchant_bank_account_not_active','merchant_profile_required','merchant_limit_reached','idempotency_key_conflict','active_qr_exists','qr_request_requires_reconciliation','buyer_role_required','merchant_codi_not_enabled','merchant_not_available','product_not_available','insufficient_stock','delivery_address_required','order_not_found','order_already_paid','checkout_requires_reconciliation'];
   const publicCode = publicCodes.find((code) => String(err.message || '').includes(code));
   if (status >= 500) console.error(JSON.stringify({ event: 'api_error', name: err.name, message: err.message, requestId: err.requestId }));
   res.status(status).json({ error: status >= 500 ? 'internal_error' : (duplicateAccount ? 'account_contact_already_registered' : publicCode || 'request_failed'), ...(err.requestId ? { providerRequestId: err.requestId } : {}) });

@@ -17,6 +17,12 @@ Esta entrega no vuelve reales el catálogo, carrito ni checkout general: esos si
 5. Abrir **Más → Cobros y cuenta Pey**, capturar la CLABE real del comercio y los datos del titular, marcar la autorización y registrar. El estado se consulta en Pey; el QR solo aparece cuando sea `ACTIVE`.
 6. Generar un QR con un importe pequeño y confirmar en pantalla que el nombre del beneficiario, cuenta e importe sean correctos antes de pagar desde una app bancaria. El pago es real y no se revierte automáticamente.
 
+## Diagnóstico de rechazos al registrar la cuenta
+
+En una revisión de cinco intentos, Pey devolvió `HTTP 400 · INCOMPLETE_PARAMETERS` para todos. La causa común identificada en el adaptador era que el alias se enviaba solo si el usuario lo capturaba, aunque el contrato de Pey lo requiere siempre. Además, BARRIO enviaba `entity` como `person` o `business`; Pey espera `PERSON` o `BUSINESS`.
+
+El adaptador ahora completa el alias con el nombre del titular cuando se deja vacío y normaliza `entity` a mayúsculas antes de llamar a `POST /bank-account`. Esta corrección está en el código local; no se debe volver a intentar el registro desde producción hasta que el cambio esté publicado. Para revisar un próximo rechazo, conserva el `requestId` de Pey y consulta su mensaje de error sin compartir la CLABE ni la API key.
+
 Pey indica que la activación CoDi de una cuenta puede tardar hasta cinco días hábiles. La API de QR exige una cuenta `ACTIVE`, acepta importes en MXN y permite un vencimiento mínimo de seis minutos. BARRIO usa diez minutos. Ver [requisitos iniciales de Pey](https://docs.pey.mx/docs/tutorials/getting-started/create-an-api-key/), [crear QR](https://docs.pey.mx/docs/api/create-qr/) y [webhook de pago QR](https://docs.pey.mx/docs/webhooks/codi/qr/).
 
 ## Seguridad y operación

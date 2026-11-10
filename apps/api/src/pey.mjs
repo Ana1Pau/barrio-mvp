@@ -25,9 +25,13 @@ async function requestPey(path, apiKey, body, { allowProduction = false, fetchIm
 export async function registerBankAccount(input, apiKey, options = {}) {
   if (!/^\d{18}$/.test(input.clabe || '')) throw new TypeError('CLABE must contain 18 digits');
   if (!input.name || !['business', 'person'].includes(input.entity)) throw new TypeError('Account owner details are required');
+  // Pey's Register Bank Account contract requires alias and uses uppercase
+  // enum values. The Barrio form historically sent alias as optional and the
+  // lowercase UI enum directly, which Pey rejected as INCOMPLETE_PARAMETERS.
+  const alias = String(input.alias || input.name).trim();
+  if (!alias) throw new TypeError('Bank account alias is required');
   return requestPey('/bank-account', apiKey, {
-    clabe: input.clabe, name: input.name, entity: input.entity,
-    ...(input.alias ? { alias: input.alias } : {}), ...(input.taxId ? { taxId: input.taxId } : {}),
+    alias, clabe: input.clabe, name: input.name.trim(), entity: input.entity.toUpperCase(),
   }, options);
 }
 
