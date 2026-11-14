@@ -552,6 +552,41 @@ app.get('/api/v1/merchant/codi/qr/latest', bearer, requireRole('Comercio'), asyn
   } catch (err) { next(err); }
 });
 
+app.get('/api/v1/merchant/codi/qrs', bearer, requireRole('Comercio'), async (req, res, next) => {
+  try {
+    if (!supabase) return res.status(501).json({ error: 'manual_codi_qr_requires_supabase' });
+    const merchantId = req.query.merchantId;
+    if (!id(merchantId || '')) return res.status(422).json({ error: 'merchant_id_required' });
+    const merchants = await supabase.select('barrio_merchants', { select: 'id', owner_user_id: `eq.${req.user.sub}`, active: 'eq.true', id: `eq.${merchantId}`, limit: '1' });
+    if (!merchants[0]) return res.status(404).json({ error: 'merchant_profile_required' });
+    const rows = await supabase.select('barrio_pey_qr_requests', { select: 'id,pey_qr_id,qr_string,amount_mxn,concept,status,created_at,expires_at,paid_at', merchant_id: `eq.${merchantId}`, order: 'created_at.desc', limit: '50' });
+    const items = await Promise.all(rows.map(async (item) => {
+      if (item.status === 'PENDING' && item.expires_at && new Date(item.expires_at).getTime() <= Date.now()) {
+        await supabase.update('barrio_pey_qr_requests', { id: `eq.${item.id}`, status: 'eq.PENDING' }, { status: 'EXPIRED' });
+        item.status = 'EXPIRED';
+      }
+      const orders = await supabase.select('barrio_orders', { select: 'id', pey_qr_request_id: `eq.${item.id}`, limit: '1' });
+      return { requestId: item.id, qrId: item.pey_qr_id, qrString: item.qr_string,
+        qrImageDataUrl: item.qr_string && item.status === 'PENDING' ? await QRCode.toDataURL(item.qr_string) : null,
+        amountMXN: Number(item.amount_mxn), concept: item.concept, status: item.status,
+        createdAt: item.created_at, expiresAt: item.expires_at, paidAt: item.paid_at,
+        checkoutOrder: Boolean(orders[0]) };
+    }));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ items });
+  } catch (err) { next(err); }
+});
+
+app.post('/api/v1/merchant/codi/qr/:requestId/cancel', bearer, requireRole('Comercio'), authLimiter, async (req, res, next) => {
+  try {
+    if (!supabase) return res.status(501).json({ error: 'manual_codi_qr_requires_supabase' });
+    if (!id(req.params.requestId || '')) return res.status(422).json({ error: 'qr_request_id_required' });
+    const result = await supabase.rpc('barrio_cancel_merchant_pey_qr', { p_user_id: req.user.sub, p_request_id: req.params.requestId });
+    return res.json({ requestId: result.request_id, status: result.status,
+      note: 'La cancelación cierra el seguimiento en BARRIO. Pey no ofrece una operación para revocar el QR, que podría seguir siendo pagable hasta vencer.' });
+  } catch (err) { next(err); }
+});
+
 app.post('/api/v1/orders/checkout', bearer, requireRole('Comprador'), authLimiter, jsonParser, async (req, res, next) => {
   try {
     if (supabase) {
@@ -752,7 +787,7 @@ app.post('/api/v1/webhooks/pey', express.raw({ type: 'application/json', limit: 
         await supabase.update('barrio_orders', { pey_qr_request_id: `eq.${qrRequest.id}`, status: 'in.(PENDING_PAYMENT,EXPIRED)' }, { status: 'PAID', paid_at: new Date(Number(event.datePaid) * 1000).toISOString() });
         return res.status(202).json({ received: true, duplicate: true });
       }
-      const updated = await supabase.update('barrio_pey_qr_requests', { id: `eq.${qrRequest.id}`, status: 'in.(PENDING,EXPIRED)' }, {
+      const updated = await supabase.update('barrio_pey_qr_requests', { id: `eq.${qrRequest.id}`, status: 'in.(PENDING,EXPIRED,CANCELLED)' }, {
         status: 'PAID', transaction_id: event.transactionId,
         paid_at: new Date(Number(event.datePaid) * 1000).toISOString(),
       });
@@ -776,14 +811,14 @@ app.use((err, req, res, _next) => {
   const duplicate = err.code === '23505' || [2601, 2627].includes(err.number);
   const duplicateAccount = req.path === '/api/v1/auth/register' && duplicate;
   const limitReached = String(err.message || '').includes('merchant_limit_reached');
-  const publicCodes = ['bank_account_not_registered','bank_account_registration_requires_reconciliation','merchant_bank_account_not_active','merchant_profile_required','merchant_limit_reached','idempotency_key_conflict','active_qr_exists','qr_request_requires_reconciliation','buyer_role_required','merchant_codi_not_enabled','merchant_not_available','product_not_available','insufficient_stock','delivery_address_required','order_not_found','order_already_paid','checkout_requires_reconciliation'];
+  const publicCodes = ['bank_account_not_registered','bank_account_registration_requires_reconciliation','merchant_bank_account_not_active','merchant_profile_required','merchant_limit_reached','idempotency_key_conflict','active_qr_exists','qr_request_requires_reconciliation','checkout_qr_cancellation_not_supported','qr_not_cancellable','buyer_role_required','merchant_codi_not_enabled','merchant_not_available','product_not_available','insufficient_stock','delivery_address_required','order_not_found','order_already_paid','checkout_requires_reconciliation'];
   const publicCode = publicCodes.find((code) => String(err.message || '').includes(code));
   // PostgREST reports PL/pgSQL business exceptions (SQLSTATE 55000) as HTTP
   // 500. Preserve the domain conflict so clients can explain active QR and
   // account-state conflicts instead of showing a misleading internal_error.
   const domainConflict = err.code === '55000' && [
     'merchant_bank_account_not_active', 'merchant_codi_not_enabled', 'active_qr_exists',
-    'order_already_paid', 'checkout_requires_reconciliation',
+    'order_already_paid', 'checkout_requires_reconciliation', 'checkout_qr_cancellation_not_supported', 'qr_not_cancellable',
   ].includes(publicCode);
   const status = duplicateAccount || limitReached || domainConflict ? 409 : (err.status || (err instanceof TypeError ? 422 : ([2601, 2627, 50102, 50104, 50108, 50109, 50111].includes(err.number) ? 409 : ([50101, 50103, 50105].includes(err.number) ? 403 : ([50112, 50114, 50119, 50122].includes(err.number) ? 409 : 500)))));
   if (status >= 500) console.error(JSON.stringify({

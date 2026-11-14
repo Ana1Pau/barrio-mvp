@@ -363,3 +363,5 @@
 .pey-checkout .checkout-payment .pay-method-copy small{position:static;display:block;font-size:9px;line-height:1.4;white-space:normal;}
 .pey-checkout .checkout-payment>b{align-self:center;flex:0 0 auto;}
 .pey-checkout .checkout-payment:has(small){padding-bottom:10px;}
+
+.pey-qr-list-head{display:flex;align-items:center;gap:10px;margin:14px 0 6px}.pey-qr-list-head>strong{flex:1;color:#165b31;font-size:12px}.pey-qr-list-head .pey-refresh{width:auto;margin:0;padding:0 9px}.pey-cancel-note{font-size:9px;line-height:1.45}.pey-qr-cancel{grid-column:1/-1;min-height:36px;border:1px solid #c96b58;border-radius:10px;background:#fff7f3;color:#9b3b29;font-size:10px;font-weight:800;cursor:pointer}.pey-qr-cancel:disabled{opacity:.55}.pey-qr-locked{grid-column:1/-1;color:#747b72;font-size:9px}
