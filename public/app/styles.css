@@ -354,3 +354,12 @@
 .merchant-buy-switch strong{font-size:10px}
 .merchant-buy-switch small{color:#6c796d;font-size:8px}
 .merchant-buy-switch>b{font-size:17px}
+
+/* Keep the CoDi checkout description in normal flow so it cannot overlap the label. */
+.pey-checkout .checkout-payment{min-height:68px;align-items:flex-start;padding:10px;}
+.pey-checkout .checkout-payment>span:first-child{flex:0 0 27px;margin-top:1px;}
+.pey-checkout .checkout-payment .pay-method-copy{min-width:0;flex:1;gap:4px;padding:1px 4px 1px 0;}
+.pey-checkout .checkout-payment .pay-method-copy strong{line-height:1.25;}
+.pey-checkout .checkout-payment .pay-method-copy small{position:static;display:block;font-size:9px;line-height:1.4;white-space:normal;}
+.pey-checkout .checkout-payment>b{align-self:center;flex:0 0 auto;}
+.pey-checkout .checkout-payment:has(small){padding-bottom:10px;}

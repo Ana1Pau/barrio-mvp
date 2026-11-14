@@ -779,7 +779,13 @@ app.use((err, req, res, _next) => {
   const status = duplicateAccount || limitReached ? 409 : (err.status || (err instanceof TypeError ? 422 : ([2601, 2627, 50102, 50104, 50108, 50109, 50111].includes(err.number) ? 409 : ([50101, 50103, 50105].includes(err.number) ? 403 : ([50112, 50114, 50119, 50122].includes(err.number) ? 409 : 500)))));
   const publicCodes = ['bank_account_not_registered','bank_account_registration_requires_reconciliation','merchant_bank_account_not_active','merchant_profile_required','merchant_limit_reached','idempotency_key_conflict','active_qr_exists','qr_request_requires_reconciliation','buyer_role_required','merchant_codi_not_enabled','merchant_not_available','product_not_available','insufficient_stock','delivery_address_required','order_not_found','order_already_paid','checkout_requires_reconciliation'];
   const publicCode = publicCodes.find((code) => String(err.message || '').includes(code));
-  if (status >= 500) console.error(JSON.stringify({ event: 'api_error', name: err.name, message: err.message, requestId: err.requestId }));
+  if (status >= 500) console.error(JSON.stringify({
+    event: 'api_error', method: req.method, path: req.path, status,
+    name: err.name, code: err.code || err.number || null,
+    message: err.message, provider: err.provider || null,
+    providerStatus: err.status || null, providerErrorType: err.providerErrorType || null,
+    requestId: err.requestId || null,
+  }));
   res.status(status).json({ error: status >= 500 ? 'internal_error' : (duplicateAccount ? 'account_contact_already_registered' : publicCode || 'request_failed'), ...(err.requestId ? { providerRequestId: err.requestId } : {}) });
 });
 
